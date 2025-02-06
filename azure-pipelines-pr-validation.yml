@@ -185,6 +185,7 @@ extends:
               # Avoid ever ending the BuildNumber with a `.` by always appending to it.
               $buildNumberName += ' #'
               Write-Host "##vso[task.setvariable variable=BuildNumber;isoutput=true;isreadonly=true]$buildNumberName"
+              Write-Host "##vso[task.setvariable variable=LocalFancyBuildNumber;isreadonly=true]$buildNumberName"
               Write-Host "##vso[build.updatebuildnumber]$buildNumberName"
 
         - task: Powershell@2
@@ -267,6 +268,31 @@ extends:
             arguments: '-configuration $(BuildConfiguration) -branchName "$(SourceBranchName)" -prValidation'
           condition: succeeded()
 
+        # Microbuild uses the build number in the drop name, and it doesn't like the fancy build number.
+        # Rest it here before we publish, then set it back when we're done.
+        - powershell: Write-Host "##vso[build.updatebuildnumber]$(OriginalBuildNumber)"
+          displayName: Reset BuildNumber
+          condition: succeeded()
+
+        - powershell: ls $(Build.SourcesDirectory)\artifacts\tmp\$(BuildConfiguration)\SymbolPackages
+          displayName: show symbols
+
+        # Use microbuild to publish symbols only to the internal feeds for PR val builds.
+        # We do not use arcade/darc as by default they get published to public feeds, and it is complicated
+        # to configure PR validation builds to push to an internal only channel.
+        - task: MicroBuildArchiveSymbols@5
+          displayName: 'Upload Symbols to Symweb/MSDL'
+          inputs:
+            SymbolsFeatureName: 'RoslynPRValidation'
+            SymbolsProject: 'DDE'
+            SymbolsAgentPath: '$(Build.SourcesDirectory)\artifacts\tmp\$(BuildConfiguration)\SymbolPackages'
+            SubmitToInternet: false
+          condition: succeeded()
+
+        - powershell: Write-Host "##vso[build.updatebuildnumber]$(LocalFancyBuildNumber)"
+          displayName: Reset BuildNumber
+          condition: succeeded()
+
         - task: PublishTestResults@2
           displayName: Publish xUnit Test Results
           inputs:
@@ -276,24 +302,9 @@ extends:
             testRunTitle: 'Unit Tests'
           condition: and(succeededOrFailed(), ne(variables['SkipTests'], 'true'))
 
-        # We need to reset the BuildNumber before we pass off to Arcade
-        - powershell: Write-Host "##vso[build.updatebuildnumber]$(OriginalBuildNumber)"
-          displayName: Reset BuildNumber
-          condition: succeeded()
-
-      # Publish to Build Asset Registry
-      - template: /eng/common/templates-official/job/publish-build-assets.yml@self
-        parameters:
-          publishUsingPipelines: true
-          dependsOn:
-          - PRValidationBuild
-          pool:
-            name: VSEngSS-MicroBuild2022-1ES
-
     - stage: insert
       dependsOn:
       - build
-      - publish_using_darc
       displayName: Insert to VS
 
       jobs:
@@ -327,18 +338,3 @@ extends:
             dropPath: '$(Pipeline.Workspace)\VSSetup'
             retainInsertedBuild: false
             cherryPick: ${{ parameters.VisualStudioCherryPickSHA }}
-        # Arcade is done so we can set BuildNumber back
-        - powershell: Write-Host "##vso[build.updatebuildnumber]$(FancyBuildNumber)"
-          displayName: Reset BuildNumber
-          condition: succeeded()
-
-    # Use post-build to publish symbol packages.
-    - template: /eng/common/templates-official/post-build/post-build.yml@self
-      parameters:
-        publishingInfraVersion: 3
-        # Symbol validation is not entirely reliable as of yet, so should be turned off until
-        # https://github.com/dotnet/arcade/issues/2871 is resolved.
-        enableSymbolValidation: false
-        enableSigningValidation: false
-        enableSourceLinkValidation: false
-        SDLValidationParameters: false
